@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+echo "🔒 Scanning staged files for secrets..."
+
+if command -v gitleaks > /dev/null 2>&1; then
+  gitleaks protect --staged --verbose || {
+    echo "❌ Secret(s) detected!"
+    exit 1
+  }
+  echo "✅ No secrets detected"
+fi
+
+echo "🎨 Formatting staged files..."
+if command -v npm > /dev/null 2>&1; then
+  npm exec -- lint-staged 2>/dev/null || true
+fi
