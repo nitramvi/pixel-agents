@@ -78,3 +78,44 @@ For the original VS Code extension version, visit [pablodelucca/pixel-agents](ht
 ## License
 
 MIT — see [LICENSE](LICENSE). Original work by Pablo De Lucca.
+
+## Security
+
+> ⚠️ **Read this before exposing the server beyond localhost.**
+
+### Gateway Token Exposure
+
+The gateway auth token (`OPENCLAW_TOKEN`) is sent in plaintext over WebSocket (`ws://`) from this server to the OpenClaw gateway. If your gateway is not on the same machine (e.g., a remote server), **anyone on the network can capture your token** and gain full access to your OpenClaw agents.
+
+- **Safe:** gateway on `localhost`
+- **Unsafe:** gateway on a remote host over the internet without `wss://`
+
+### No Authentication on HTTP Endpoints
+
+The web server has **no authentication** on any endpoint:
+- `/api/settings` — anyone can read/write server configuration
+- `/api/layout` — anyone can save or load office layouts
+- `/api/spawn` — anyone can spawn new agent sessions
+- `/ws` — anyone can connect and receive real-time agent activity
+
+Anyone who can reach the server port can control it.
+
+### No Transport Encryption
+
+The server speaks plain HTTP, not HTTPS. **Always put it behind a reverse proxy** (like Caddy, Nginx, or Cloudflare) that handles TLS termination.
+
+### Recommended Deployment
+
+```
+Internet → Cloudflare (TLS) → Nginx (TLS) → localhost:19100
+```
+
+Never expose port 19100 directly to the internet.
+
+### Environment Variables
+
+The gateway token is passed via environment variable. On shared servers, other processes may read `/proc/[pid]/environ`. Consider using a dedicated user or container isolation.
+
+---
+
+*These are inherent limitations of the standalone server — the original VS Code extension avoided them by running inside an authenticated IDE context. Pull requests addressing any of these are welcome.*
