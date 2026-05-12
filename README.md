@@ -47,10 +47,17 @@ docker run -d -p 19100:19100 \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `19100` | HTTP port |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `19100` | HTTP(S) port |
 | `OPENCLAW_HOST` | `localhost` | Gateway hostname |
 | `OPENCLAW_PORT` | `18789` | Gateway port |
 | `OPENCLAW_TOKEN` | — | Gateway auth token (required) |
+| `OPENCLAW_TOKEN_FILE` | — | Read token from file instead of env var |
+| `OPENCLAW_SCHEME` | `ws` | Gateway WebSocket scheme: `ws` or `wss` |
+| `API_TOKEN` | — | Optional auth for REST API + WebSocket |
+| `TLS_CERT` | — | Path to TLS certificate (enables HTTPS) |
+| `TLS_KEY` | — | Path to TLS private key |
 
 Settings and layouts are saved to `~/.pixel-agents/`.
 

@@ -56,6 +56,7 @@ interface SubagentInfo {
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const DEFAULT_PORT = 18789;
+const DEFAULT_SCHEME = 'ws';
 const RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 const TICK_TIMEOUT_MS = 60000;
@@ -68,6 +69,7 @@ export class OpenClawClient extends EventEmitter {
   private host: string;
   private port: number;
   private token: string;
+  private scheme: string;
   private requestId = 0;
   private sessions = new Map<string, AgentSession>();
   private activeToolIds = new Map<string, string>();
@@ -90,10 +92,25 @@ export class OpenClawClient extends EventEmitter {
     const envPort = process.env['OPENCLAW_PORT'];
 
     if (envToken && envPort) {
+      const envScheme = process.env['OPENCLAW_SCHEME'] || DEFAULT_SCHEME;
+      const envTokenFile = process.env['OPENCLAW_TOKEN_FILE'];
+
+      // Resolve token: from file takes precedence over env var
+      let resolvedToken = envToken;
+      if (envTokenFile) {
+        try {
+          resolvedToken = readFileSync(envTokenFile, 'utf-8').trim();
+          console.log(`[OpenClawClient] Token loaded from file: ${envTokenFile}`);
+        } catch (e) {
+          console.error(`[OpenClawClient] Failed to read token file: ${envTokenFile}`, e);
+        }
+      }
+
       this.host = envHost || 'host.docker.internal';
-      this.token = envToken;
+      this.token = resolvedToken || '';
       this.port = parseInt(envPort, 10) || DEFAULT_PORT;
-      console.log(`[OpenClawClient] Using env vars → ws://${this.host}:${this.port}`);
+      this.scheme = envScheme;
+      console.log(`[OpenClawClient] Using env vars → ${this.scheme}://${this.host}:${this.port}`);
       return;
     }
 
@@ -106,6 +123,7 @@ export class OpenClawClient extends EventEmitter {
       this.host = 'localhost';
       this.token = auth.token as string;
       this.port = (gateway.port as number) || DEFAULT_PORT;
+      this.scheme = DEFAULT_SCHEME;
     } catch {
       // Last resort: env vars only
       const fbToken = process.env['OPENCLAW_TOKEN'];
@@ -119,6 +137,7 @@ export class OpenClawClient extends EventEmitter {
       this.host = process.env['OPENCLAW_HOST'] || 'localhost';
       this.token = fbToken;
       this.port = parseInt(fbPort || String(DEFAULT_PORT), 10);
+      this.scheme = process.env['OPENCLAW_SCHEME'] || DEFAULT_SCHEME;
     }
 
     if (!this.token) {
@@ -128,7 +147,7 @@ export class OpenClawClient extends EventEmitter {
 
   async connect(): Promise<void> {
     if (this.disposed) return;
-    const url = `ws://${this.host}:${this.port}`;
+    const url = `${this.scheme}://${this.host}:${this.port}`;
     console.log(`[OpenClawClient] Connecting to ${url}`);
 
     return new Promise((resolve, reject) => {

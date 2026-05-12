@@ -5,16 +5,18 @@
  * real-time agent state updates via OpenClaw gateway integration,
  * and persists user settings + layout to disk.
  *
- * Usage:
- *   npm run build:standalone
- *   npm run start
+ * Optional security (opt-in via env vars):
+ *   API_TOKEN=<secret>      — Bearer auth for /api/* and /ws
+ *   TLS_CERT=<path>         — HTTPS/WSS (also requires TLS_KEY)
+ *   TLS_KEY=<path>          — TLS private key
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { createServer } from 'node:http';
+import { createServer as createTlsServer } from 'node:https';
 import { WebSocketServer, WebSocket } from 'ws';
 
 import { ConfigManager } from './configManager.js';
@@ -29,9 +31,60 @@ const WEBVIEW_DIST = join(PROJECT_ROOT, 'dist', 'webview');
 
 const PORT = parseInt(process.env.PORT || '19100', 10);
 
+// ── Optional auth token ──────────────────────────────────────────────────────
+const API_TOKEN = process.env['API_TOKEN'] || '';
+const requiresAuth = API_TOKEN.length > 0;
+
+/** Check Authorization header against API_TOKEN. */
+function authOk(req: { headers: Record<string, string | string[] | undefined> }): boolean {
+  if (!requiresAuth) return true;
+  const header = req.headers['authorization'];
+  if (!header) return false;
+  const match = (Array.isArray(header) ? header[0] : header).match(/^Bearer\s+(.+)$/);
+  if (!match) return false;
+  return match[1] === API_TOKEN;
+}
+
+/** Express middleware — 401 if auth is required and missing. */
+function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  if (!requiresAuth) return next();
+  if (authOk(req)) return next();
+  res.status(401).json({ error: 'unauthorized' });
+}
+
+/** Validate WebSocket upgrade request against API_TOKEN. */
+function wsAuthOk(req: { headers: Record<string, string | string[] | undefined> }): boolean {
+  if (!requiresAuth) return true;
+  return authOk(req);
+}
+
+// ── TLS ──────────────────────────────────────────────────────────────────────
+
+const TLS_CERT = process.env['TLS_CERT'] || '';
+const TLS_KEY = process.env['TLS_KEY'] || '';
+const useTls = !!(TLS_CERT && TLS_KEY && existsSync(TLS_CERT) && existsSync(TLS_KEY));
+
+let tlsOptions: { cert: string; key: string } | undefined;
+if (useTls) {
+  tlsOptions = {
+    cert: readFileSync(TLS_CERT, 'utf-8'),
+    key: readFileSync(TLS_KEY, 'utf-8'),
+  };
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
+  const proto = useTls ? 'https' : 'http';
+  const wsProto = useTls ? 'wss' : 'ws';
+
+  if (requiresAuth) {
+    console.log(`[PixelAgents] Auth enabled (API_TOKEN set)`);
+  }
+  if (useTls) {
+    console.log(`[PixelAgents] TLS enabled (${TLS_CERT})`);
+  }
+
   console.log(`[PixelAgents] Starting standalone server on port ${PORT}...`);
   console.log(`[PixelAgents] Webview dist: ${WEBVIEW_DIST}`);
 
@@ -49,8 +102,10 @@ async function main() {
 
   const app = express();
 
-  // JSON body parser for REST endpoints
   app.use(express.json({ limit: '1mb' }));
+
+  // Auth middleware for /api/*
+  app.use('/api', authMiddleware);
 
   // Serve static frontend
   app.use('/assets', express.static(join(WEBVIEW_DIST, 'assets'), {
@@ -110,7 +165,7 @@ async function main() {
     res.json({ ok: true });
   });
 
-  // HTML must never be cached (SPA with hashed assets for cache busting)
+  // HTML must never be cached
   app.use((req, res, next) => {
     if (req.path === '/' || req.path.endsWith('.html')) {
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -120,7 +175,7 @@ async function main() {
     next();
   });
 
-  // Serve index.html and other root-level files
+  // Serve static files (no auth — these are public assets)
   app.use(express.static(WEBVIEW_DIST));
 
   // Fallback to index.html for SPA routing
@@ -128,10 +183,24 @@ async function main() {
     res.sendFile(join(WEBVIEW_DIST, 'index.html'));
   });
 
-  // ── HTTP + WebSocket server ────────────────────────────────────────────────
+  // ── HTTP(S) + WebSocket server ─────────────────────────────────────────────
 
-  const httpServer = createServer(app);
-  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+  const httpServer = useTls
+    ? createTlsServer(tlsOptions!, app)
+    : createServer(app);
+
+  // WebSocket with optional auth check on upgrade
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: '/ws',
+    verifyClient: (info, cb) => {
+      if (wsAuthOk(info.req as unknown as { headers: Record<string, string | string[] | undefined> })) {
+        cb(true);
+      } else {
+        cb(false, 401, 'unauthorized');
+      }
+    },
+  });
 
   const wsClients = new Set<WebSocket>();
 
@@ -152,14 +221,12 @@ async function main() {
       layout,
     });
 
-    // Send all current sessions immediately
     const sessions = openclaw.getSessions();
     sendToClient(ws, {
       type: 'initial_state',
       sessions: sessions.map((s) => serializeSession(s)),
     });
 
-    // Handle incoming messages from the webview client
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
@@ -192,61 +259,48 @@ async function main() {
         }
         break;
       }
-
       case 'setSoundEnabled': {
         const enabled = msg.enabled as boolean;
         config.update({ soundEnabled: enabled });
         broadcast({ type: 'sound_enabled', enabled });
         break;
       }
-
       case 'setWatchAllSessions': {
         const enabled = msg.enabled as boolean;
         config.update({ watchAllSessions: enabled });
         break;
       }
-
       case 'setAlwaysShowLabels': {
         const enabled = msg.enabled as boolean;
         config.update({ alwaysShowLabels: enabled });
         break;
       }
-
       case 'setLastSeenVersion': {
         const version = msg.version as string;
         config.update({ lastSeenVersion: version });
         break;
       }
-
       case 'setHooksEnabled': {
-        const enabled = msg.enabled as boolean;
-        config.update({ ...config.get() }); // hooksEnabled is Claude-specific, just persist
+        config.update({ ...config.get() });
         break;
       }
-
       case 'setHooksInfoShown': {
         config.update({ hooksInfoShown: true });
         break;
       }
-
       case 'openClaude': {
         openclaw.spawnAgent('New agent spawned from Pixel Agents panel');
         break;
       }
-
       case 'closeAgent': {
         const agentId = msg.id as number;
-        // Find session key by agent ID (reverse lookup via the server's agent map)
-        // broadcast removal so bridge handles cleanup
         broadcast({ type: 'agent_remove', id: agentId });
         break;
       }
-
       case 'focusAgent': {
-        // No terminal to focus in standalone mode — this is a no-op
+        // No terminal to focus in standalone mode
         break;
       }
-
       default:
         console.log('[PixelAgents] Unknown client message:', msg.type);
     }
@@ -275,112 +329,53 @@ async function main() {
 
   const openclaw = new OpenClawClient();
 
-  // Agent joining
   openclaw.on('agent_join', (event: AgentEvent) => {
-    broadcast({
-      type: 'agent_join',
-      session: serializeSession(event.session),
-    });
+    broadcast({ type: 'agent_join', session: serializeSession(event.session) });
   });
 
-  // Agent left
   openclaw.on('agent_leave', (event: AgentEvent) => {
-    broadcast({
-      type: 'agent_leave',
-      sessionKey: event.session.key,
-    });
+    broadcast({ type: 'agent_leave', sessionKey: event.session.key });
   });
 
-  // Active state changes
   openclaw.on('agent_active', (event: AgentEvent) => {
-    broadcast({
-      type: 'agent_update',
-      session: serializeSession({ ...event.session, isActive: true }),
-      active: true,
-    });
+    broadcast({ type: 'agent_update', session: serializeSession({ ...event.session, isActive: true }), active: true });
   });
 
   openclaw.on('agent_idle', (event: AgentEvent) => {
-    broadcast({
-      type: 'agent_update',
-      session: serializeSession({ ...event.session, isActive: false }),
-      active: false,
-    });
+    broadcast({ type: 'agent_update', session: serializeSession({ ...event.session, isActive: false }), active: false });
   });
 
-  // Waiting state (tool call complete, awaiting user input)
   openclaw.on('agent_waiting', (event: AgentEvent) => {
-    broadcast({
-      type: 'agent_waiting',
-      sessionKey: event.session.key,
-    });
+    broadcast({ type: 'agent_waiting', sessionKey: event.session.key });
   });
 
-  // Permission request
   openclaw.on('agent_permission', (event: AgentEvent) => {
-    broadcast({
-      type: 'agent_permission',
-      sessionKey: event.session.key,
-      toolName: event.toolName,
-      toolId: event.toolId,
-    });
+    broadcast({ type: 'agent_permission', sessionKey: event.session.key, toolName: event.toolName, toolId: event.toolId });
   });
 
-  // Tool events
   openclaw.on('agent_tool_start', (event: AgentEvent) => {
-    broadcast({
-      type: 'agent_tool_start',
-      session: serializeSession(event.session),
-      toolName: event.toolName,
-      toolId: event.toolId || `tool-${Date.now()}`,
-    });
+    broadcast({ type: 'agent_tool_start', session: serializeSession(event.session), toolName: event.toolName, toolId: event.toolId || `tool-${Date.now()}` });
   });
 
   openclaw.on('agent_tool_end', (event: AgentEvent) => {
-    broadcast({
-      type: 'agent_tool_end',
-      session: serializeSession(event.session),
-      toolName: event.toolName,
-      toolId: event.toolId || `tool-${Date.now()}`,
-    });
+    broadcast({ type: 'agent_tool_end', session: serializeSession(event.session), toolName: event.toolName, toolId: event.toolId || `tool-${Date.now()}` });
   });
 
-  // Sub-agent events
   openclaw.on('subagent_join', (event: AgentEvent) => {
-    broadcast({
-      type: 'subagent_join',
-      session: serializeSession(event.session),
-      toolName: event.toolName,
-      toolId: event.toolId,
-      parentSessionKey: event.parentSessionKey,
-    });
+    broadcast({ type: 'subagent_join', session: serializeSession(event.session), toolName: event.toolName, toolId: event.toolId, parentSessionKey: event.parentSessionKey });
   });
 
   openclaw.on('subagent_tool_start', (event: AgentEvent) => {
-    broadcast({
-      type: 'subagent_tool_start',
-      session: serializeSession(event.session),
-      toolName: event.toolName,
-      toolId: event.toolId,
-      parentSessionKey: event.parentSessionKey,
-    });
+    broadcast({ type: 'subagent_tool_start', session: serializeSession(event.session), toolName: event.toolName, toolId: event.toolId, parentSessionKey: event.parentSessionKey });
   });
 
   openclaw.on('subagent_leave', (event: AgentEvent) => {
-    broadcast({
-      type: 'subagent_leave',
-      sessionKey: event.session.key,
-    });
+    broadcast({ type: 'subagent_leave', sessionKey: event.session.key });
   });
 
-  // Connected event — re-send state after reconnect
   openclaw.on('connected', () => {
     console.log('[PixelAgents] Reconnected to OpenClaw gateway, re-sending sessions');
-    const sessions = openclaw.getSessions();
-    broadcast({
-      type: 'initial_state',
-      sessions: sessions.map((s) => serializeSession(s)),
-    });
+    broadcast({ type: 'initial_state', sessions: openclaw.getSessions().map((s) => serializeSession(s)) });
   });
 
   // ── Detect leaves via periodic session diff ────────────────────────────────
@@ -389,19 +384,14 @@ async function main() {
   setInterval(() => {
     const currentKeys = new Set(openclaw.getSessions().map((s) => s.key));
     for (const key of previousKeys) {
-      if (!currentKeys.has(key)) {
-        broadcast({ type: 'agent_leave', sessionKey: key });
-      }
+      if (!currentKeys.has(key)) broadcast({ type: 'agent_leave', sessionKey: key });
     }
     previousKeys.clear();
     for (const key of currentKeys) previousKeys.add(key);
 
-    // Clean detached sub-agents
     const subagents = openclaw.getSubagents();
     for (const [skey] of subagents) {
-      if (!currentKeys.has(skey)) {
-        broadcast({ type: 'subagent_leave', sessionKey: skey });
-      }
+      if (!currentKeys.has(skey)) broadcast({ type: 'subagent_leave', sessionKey: skey });
     }
   }, 5000);
 
@@ -414,11 +404,11 @@ async function main() {
     console.log('[PixelAgents] Server will run without agents — reconnect in progress');
   }
 
-  // ── Start HTTP server ──────────────────────────────────────────────────────
+  // ── Start HTTP(S) server ──────────────────────────────────────────────────
 
   httpServer.listen(PORT, () => {
-    console.log(`[PixelAgents] Server running on http://localhost:${PORT}`);
-    console.log(`[PixelAgents] WebSocket endpoint: ws://localhost:${PORT}/ws`);
+    console.log(`[PixelAgents] Server running on ${proto}://localhost:${PORT}`);
+    console.log(`[PixelAgents] WebSocket endpoint: ${wsProto}://localhost:${PORT}/ws`);
   });
 
   // ── Graceful shutdown ──────────────────────────────────────────────────────
